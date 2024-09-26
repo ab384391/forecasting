@@ -1,160 +1,113 @@
-import numpy as np
-import pandas as pd
+# models/deep_learning_models.py
+
 import tensorflow as tf
-from tensorflow.keras.models import Model, Sequential
-from tensorflow.keras.layers import Dense, LSTM, Conv1D, Input, Dropout, GlobalAveragePooling1D, Attention
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, LSTM, Conv1D, GlobalAveragePooling1D, Input, Concatenate, Reshape
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
-from typing import Tuple, List
-from sklearn.preprocessing import StandardScaler
-from .base_forecaster import BaseForecaster
+from .base_forecaster import Forecaster
+import numpy as np
 
-class DeepLearningForecaster(BaseForecaster):
-    def __init__(self, model_type: str, input_shape: Tuple[int, int], output_shape: int, learning_rate: float = 0.001):
+class DeepLearningForecaster(Forecaster):
+    def __init__(self, model_type: str, input_shape: tuple, output_shape: int, **kwargs):
         self.model_type = model_type
-        self.input_shape = input_shape
-        self.output_shape = output_shape
-        self.learning_rate = learning_rate
-        self.model = self._build_model()
-        self.feature_scaler = StandardScaler()
-        self.target_scaler = StandardScaler()
+        self.model = self._build_model(input_shape, output_shape, **kwargs)
 
-    def _build_model(self) -> Model:
+    def _build_model(self, input_shape: tuple, output_shape: int, **kwargs) -> tf.keras.Model:
         if self.model_type == 'LSTM':
-            return self._build_lstm_model()
+            return self._build_lstm(input_shape, output_shape)
         elif self.model_type == 'TCN':
-            return self._build_tcn_model()
+            return self._build_tcn(input_shape, output_shape)
         elif self.model_type == 'Transformer':
-            return self._build_transformer_model()
+            return self._build_transformer(input_shape, output_shape)
+        elif self.model_type == 'TFT':
+            return self._build_tft(input_shape, output_shape, **kwargs)
+        elif self.model_type == 'NBeats':
+            return self._build_nbeats(input_shape, output_shape, **kwargs)
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
-    def _build_lstm_model(self) -> Model:
-        model = Sequential([
-            LSTM(50, activation='relu', input_shape=self.input_shape, return_sequences=True),
-            LSTM(50, activation='relu'),
-            Dense(self.output_shape)
+    def _build_lstm(self, input_shape: tuple, output_shape: int) -> tf.keras.Model:
+        model = tf.keras.Sequential([
+            LSTM(64, input_shape=input_shape, return_sequences=True),
+            LSTM(32),
+            Dense(output_shape)
         ])
-        model.compile(optimizer=Adam(learning_rate=self.learning_rate), loss='mse')
+        model.compile(optimizer=Adam(), loss='mse')
         return model
 
-    def _build_tcn_model(self) -> Model:
-        def tcn_block(x, dilation_rate):
-            x = Conv1D(filters=64, kernel_size=2, dilation_rate=dilation_rate, padding='causal')(x)
-            x = tf.keras.layers.Activation('relu')(x)
-            x = Dropout(0.2)(x)
-            return x
+    def _build_tcn(self, input_shape: tuple, output_shape: int) -> tf.keras.Model:
+        model = tf.keras.Sequential([
+            Conv1D(64, kernel_size=2, activation='relu', input_shape=input_shape),
+            Conv1D(32, kernel_size=2, activation='relu'),
+            GlobalAveragePooling1D(),
+            Dense(output_shape)
+        ])
+        model.compile(optimizer=Adam(), loss='mse')
+        return model
 
-        inputs = Input(shape=self.input_shape)
+    def _build_transformer(self, input_shape: tuple, output_shape: int) -> tf.keras.Model:
+        inputs = Input(shape=input_shape)
+        x = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=32)(inputs, inputs)
+        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        x = Dense(64, activation='relu')(x)
+        outputs = Dense(output_shape)(x)
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=Adam(), loss='mse')
+        return model
+
+    def _build_tft(self, input_shape: tuple, output_shape: int, 
+                   num_heads: int = 4, dropout: float = 0.1, 
+                   ff_dim: int = 256) -> tf.keras.Model:
+        inputs = Input(shape=input_shape)
         x = inputs
-
-        for dilation_rate in [1, 2, 4, 8]:
-            x = tcn_block(x, dilation_rate)
-
-        x = GlobalAveragePooling1D()(x)
-        outputs = Dense(self.output_shape)(x)
-
+        for _ in range(2):  # Using 2 Transformer layers
+            attention_output = tf.keras.layers.MultiHeadAttention(
+                num_heads=num_heads, key_dim=input_shape[-1])(x, x)
+            x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(attention_output + x)
+            ff = Dense(ff_dim, activation="relu")(x)
+            ff = Dense(input_shape[-1])(ff)
+            x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + ff)
+        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        outputs = Dense(output_shape)(x)
         model = Model(inputs=inputs, outputs=outputs)
-        model.compile(optimizer=Adam(learning_rate=self.learning_rate), loss='mse')
+        model.compile(optimizer=Adam(), loss='mse')
         return model
 
-    def _build_transformer_model(self) -> Model:
-        def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
-            x = Attention(num_heads=num_heads, key_dim=head_size)(inputs, inputs)
-            x = Dropout(dropout)(x)
-            res = x + inputs
-            x = Dense(ff_dim, activation="relu")(res)
-            x = Dense(inputs.shape[-1])(x)
-            return x + res
+    def _build_nbeats(self, input_shape: tuple, output_shape: int, 
+                      num_stacks: int = 30, num_blocks: int = 1, 
+                      num_layers: int = 4, layer_width: int = 256) -> tf.keras.Model:
+        def create_block(x, theta_layer):
+            backcast, forecast = theta_layer(x)
+            return backcast, forecast
 
-        inputs = Input(shape=self.input_shape)
-        x = Dense(32, activation="relu")(inputs)
-        x = transformer_encoder(x, head_size=32, num_heads=2, ff_dim=32, dropout=0.1)
-        x = GlobalAveragePooling1D()(x)
-        outputs = Dense(self.output_shape)(x)
+        inputs = Input(shape=input_shape)
+        backcast = inputs
+        forecast = tf.zeros_like(inputs)[:, -output_shape:]
 
-        model = Model(inputs=inputs, outputs=outputs)
-        model.compile(optimizer=Adam(learning_rate=self.learning_rate), loss='mse')
+        for _ in range(num_stacks):
+            for _ in range(num_blocks):
+                theta_layer = Dense(2 * layer_width, activation='relu')
+                for _ in range(num_layers - 1):
+                    theta_layer = Dense(layer_width, activation='relu')(theta_layer)
+                theta_layer = Dense(input_shape[0] + output_shape)(theta_layer)
+                backcast_block, forecast_block = create_block(backcast, theta_layer)
+                backcast = tf.keras.layers.subtract([backcast, backcast_block])
+                forecast = tf.keras.layers.add([forecast, forecast_block])
+
+        model = Model(inputs=inputs, outputs=forecast)
+        model.compile(optimizer=Adam(), loss='mse')
         return model
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
-        X_scaled = self.feature_scaler.fit_transform(X)
-        y_scaled = self.target_scaler.fit_transform(y.values.reshape(-1, 1))
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        X_reshaped = X.reshape((X.shape[0], X.shape[1], 1))
+        self.model.fit(X_reshaped, y, epochs=100, batch_size=32, verbose=0)
 
-        X_reshaped = X_scaled.reshape((X_scaled.shape[0], self.input_shape[0], self.input_shape[1]))
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X_reshaped = X.reshape((X.shape[0], X.shape[1], 1))
+        return self.model.predict(X_reshaped).flatten()
 
-        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-        self.model.fit(X_reshaped, y_scaled, epochs=100, batch_size=32, validation_split=0.2, callbacks=[early_stopping])
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        X_scaled = self.feature_scaler.transform(X)
-        X_reshaped = X_scaled.reshape((X_scaled.shape[0], self.input_shape[0], self.input_shape[1]))
-        y_pred_scaled = self.model.predict(X_reshaped)
-        return self.target_scaler.inverse_transform(y_pred_scaled)
-
-    def predict_interval(self, X: pd.DataFrame, alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        X_scaled = self.feature_scaler.transform(X)
-        X_reshaped = X_scaled.reshape((X_scaled.shape[0], self.input_shape[0], self.input_shape[1]))
-
-        # Monte Carlo Dropout for uncertainty estimation
-        n_iterations = 100
-        y_pred_list = [self.model(X_reshaped, training=True) for _ in range(n_iterations)]
-        y_pred_scaled = np.mean(y_pred_list, axis=0)
-        y_pred_std = np.std(y_pred_list, axis=0)
-
-        y_pred = self.target_scaler.inverse_transform(y_pred_scaled)
-        y_pred_std = y_pred_std * self.target_scaler.scale_
-
-        lower_bound = y_pred - 1.96 * y_pred_std
-        upper_bound = y_pred + 1.96 * y_pred_std
-
-        return y_pred.squeeze(), lower_bound.squeeze(), upper_bound.squeeze()
-
-    def get_feature_importance(self) -> pd.DataFrame:
-        # For deep learning models, we'll use a simple sensitivity analysis
-        X_scaled = self.feature_scaler.transform(np.random.randn(1000, self.input_shape[0] * self.input_shape[1]))
-        X_reshaped = X_scaled.reshape((X_scaled.shape[0], self.input_shape[0], self.input_shape[1]))
-        
-        base_prediction = self.model.predict(X_reshaped)
-        
-        importance = []
-        for i in range(X_scaled.shape[1]):
-            X_perturbed = X_scaled.copy()
-            X_perturbed[:, i] += np.std(X_scaled[:, i])
-            X_perturbed_reshaped = X_perturbed.reshape((X_perturbed.shape[0], self.input_shape[0], self.input_shape[1]))
-            perturbed_prediction = self.model.predict(X_perturbed_reshaped)
-            importance.append(np.mean(np.abs(perturbed_prediction - base_prediction)))
-        
-        feature_names = [f'feature_{i}' for i in range(X_scaled.shape[1])]
-        return pd.DataFrame({'feature': feature_names, 'importance': importance}).sort_values('importance', ascending=False)
-
-    def clone(self) -> 'DeepLearningForecaster':
-        return DeepLearningForecaster(self.model_type, self.input_shape, self.output_shape, self.learning_rate)
-
-    def save(self, path: str) -> None:
-        self.model.save(path)
-        np.save(f"{path}_feature_scaler", self.feature_scaler.get_params())
-        np.save(f"{path}_target_scaler", self.target_scaler.get_params())
-
-    @classmethod
-    def load(cls, path: str) -> 'DeepLearningForecaster':
-        model = tf.keras.models.load_model(path)
-        feature_scaler = StandardScaler()
-        feature_scaler.set_params(**np.load(f"{path}_feature_scaler.npy", allow_pickle=True).item())
-        target_scaler = StandardScaler()
-        target_scaler.set_params(**np.load(f"{path}_target_scaler.npy", allow_pickle=True).item())
-        
-        forecaster = cls(model.name, model.input_shape[1:], model.output_shape[1])
-        forecaster.model = model
-        forecaster.feature_scaler = feature_scaler
-        forecaster.target_scaler = target_scaler
-        return forecaster
-
-# Usage example:
-# input_shape = (10, 5)  # 10 time steps, 5 features
-# output_shape = 1  # Single step forecast
-# forecaster = DeepLearningForecaster('LSTM', input_shape, output_shape)
-# forecaster.fit(X_train, y_train)
-# predictions = forecaster.predict(X_test)
-# predictions, lower_bound, upper_bound = forecaster.predict_interval(X_test)
-# feature_importance = forecaster.get_feature_importance()
+    def get_feature_importance(self) -> np.ndarray:
+        # For deep learning models, feature importance is not straightforward
+        # We'll use a simple approach based on the first layer weights
+        importance = np.abs(self.model.layers[0].get_weights()[0]).mean(axis=1).flatten()
+        return importance

@@ -1,175 +1,135 @@
+# main.py
+
 import pandas as pd
-import numpy as np
-from typing import Dict, Any, Tuple
+import yaml
+from typing import Dict, Any
+import logging
 from data.data_loader import FastDataLoader
 from data.preprocessor import FastPreprocessor
 from feature_engineering.auto_feature_engineer import AutoFeatureEngineer
+from feature_engineering.feature_experiment_runner import FeatureExperimentRunner
 from models.deep_learning_models import DeepLearningForecaster
-from models.tree_based_models import GradientBoostForecaster, LightGBMForecaster
-from models.base_forecaster import BaseForecaster
-from optimization.optuna_optimizer import OptunaOptimizer, create_param_space
+from models.tree_based_models import TreeBasedForecaster
+from models.ensemble_forecaster import EnsembleForecaster
+from optimization.optuna_optimizer import OptunaOptimizer
 from evaluation.backtester import FastBacktester
-from evaluation.metrics import calculate_all_metrics
-from utils.config import Config, create_default_config
-from utils.logging_utils import setup_logger, log_execution_time, log_exception
-import joblib
+from evaluation.metrics import mean_absolute_error, root_mean_squared_error, symmetric_mean_absolute_percentage_error
+from evaluation.visualization import plot_forecast, plot_metric_over_time, plot_feature_importance
 
-@log_execution_time(logger)
-@log_exception(logger)
-def load_data(config: Config) -> pd.DataFrame:
-    """Load the data."""
-    loader = FastDataLoader(config['data']['input_file'], config['data']['date_column'], config['data']['target_column'])
-    df = loader.load_data()
-    return df
+def load_config(config_path: str) -> Dict[str, Any]:
+    with open(config_path, 'r') as file:
+        return yaml.safe_load(file)
 
-@log_execution_time(logger)
-@log_exception(logger)
-def preprocess_and_engineer_features(df: pd.DataFrame, config: Config, is_training: bool = True) -> Tuple[pd.DataFrame, FastPreprocessor, AutoFeatureEngineer]:
-    """Preprocess the data and engineer features."""
-    if is_training:
-        preprocessor = FastPreprocessor(config['data']['features'], [config['data']['target_column']], config['data']['date_column'])
-        auto_fe = AutoFeatureEngineer(config['feature_engineering'])
-    else:
-        preprocessor = joblib.load(config['output']['preprocessor_path'])
-        auto_fe = joblib.load(config['output']['feature_engineer_path'])
-    
-    df = preprocessor.preprocess(df, is_training=is_training)
-    df = auto_fe.engineer_features(df, config['data']['date_column'], config['data']['target_column'], is_training=is_training)
-    
-    return df, preprocessor, auto_fe
+def setup_logging(log_level: str = 'INFO') -> None:
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 
-@log_execution_time(logger)
-@log_exception(logger)
-def split_data(df: pd.DataFrame, config: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Split the data into training and testing sets based on a specific date."""
-    split_date = pd.to_datetime(config['training']['split_date'])
-    
-    train_df = df[df[config['data']['date_column']] < split_date]
-    test_df = df[df[config['data']['date_column']] >= split_date]
-    
-    return train_df, test_df
-
-@log_execution_time(logger)
-@log_exception(logger)
-def create_model(config: Config) -> BaseForecaster:
-    """Create the forecasting model based on configuration."""
-    model_type = config['model']['type']
-    model_params = config['model']['params']
-    
-    if model_type == 'LSTM':
-        return DeepLearningForecaster('LSTM', **model_params)
-    elif model_type == 'GradientBoost':
-        return GradientBoostForecaster(**model_params)
-    elif model_type == 'LightGBM':
-        return LightGBMForecaster(**model_params)
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}")
-
-@log_execution_time(logger)
-@log_exception(logger)
-def optimize_model(model: BaseForecaster, X: pd.DataFrame, y: pd.Series, config: Config) -> Dict[str, Any]:
-    """Optimize model hyperparameters."""
-    param_space = create_param_space(config['model']['type'])
-    optimizer = OptunaOptimizer(type(model), param_space, n_trials=config['optimization']['n_trials'])
-    best_params = optimizer.optimize(X, y)
-    return best_params
-
-@log_execution_time(logger)
-@log_exception(logger)
-def train_model(model: BaseForecaster, X_train: pd.DataFrame, y_train: pd.Series) -> BaseForecaster:
-    """Train the model on the training data."""
-    model.fit(X_train, y_train)
-    return model
-
-@log_execution_time(logger)
-@log_exception(logger)
-def evaluate_model(model: BaseForecaster, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, Any]:
-    """Evaluate the model on the test data."""
-    y_pred = model.predict(X_test)
-    metrics = calculate_all_metrics(y_test, y_pred)
-    return {'predictions': y_pred, 'metrics': metrics}
-
-@log_execution_time(logger)
-def main():
+def main(config_path: str) -> None:
     # Load configuration
-    create_default_config('config.yaml')
-    config = Config('config.yaml')
+    config = load_config(config_path)
     
-    # Load data
-    df = load_data(config)
-    logger.info(f"Data loaded. Shape: {df.shape}")
+    # Setup logging
+    setup_logging(config.get('log_level', 'INFO'))
+    logger = logging.getLogger(__name__)
     
-    # Split data into train and test sets
-    train_df, test_df = split_data(df, config)
-    logger.info(f"Data split into train and test sets. Train shape: {train_df.shape}, Test shape: {test_df.shape}")
+    logger.info("Starting forecasting pipeline")
     
-    # Preprocess and engineer features for training data
-    train_df, preprocessor, auto_fe = preprocess_and_engineer_features(train_df, config, is_training=True)
-    logger.info(f"Training data preprocessed and features engineered. New shape: {train_df.shape}")
+    try:
+        # Load data
+        logger.info("Loading data")
+        data_loader = FastDataLoader(config['data']['file_path'], use_dask=config['data'].get('use_dask', False))
+        data = data_loader.load_data()
+        
+        # Preprocess data
+        logger.info("Preprocessing data")
+        preprocessor = FastPreprocessor(
+            categorical_cols=config['preprocessing']['categorical_cols'],
+            numerical_cols=config['preprocessing']['numerical_cols']
+        )
+        data = preprocessor.fit_transform(data)
+        
+        # Feature engineering
+        logger.info("Performing feature engineering")
+        feature_engineer = AutoFeatureEngineer(config['feature_engineering'])
+        data = feature_engineer.generate_features(data, config['target_column'])
+        
+        if config.get('run_feature_experiments', False):
+            logger.info("Running feature engineering experiments")
+            experiment_runner = FeatureExperimentRunner(config['feature_engineering'], config['target_column'])
+            experiment_results = experiment_runner.run_experiments(data, config['feature_experiments'])
+            best_experiment = experiment_runner.get_best_experiment(experiment_results, mean_absolute_error)
+            logger.info(f"Best feature engineering experiment: {best_experiment}")
+            data = experiment_results[best_experiment]
+        
+        # Split data
+        X = data.drop(columns=[config['target_column']])
+        y = data[config['target_column']]
+        
+        # Model selection and training
+        logger.info("Training models")
+        models = []
+        for model_config in config['models']:
+            if model_config['type'] == 'deep_learning':
+                model = DeepLearningForecaster(
+                    model_config['model_type'],
+                    input_shape=(X.shape[1], 1),
+                    output_shape=1,
+                    **model_config.get('params', {})
+                )
+            elif model_config['type'] == 'tree_based':
+                model = TreeBasedForecaster(model_config['model_type'])
+            else:
+                raise ValueError(f"Unsupported model type: {model_config['type']}")
+            
+            if model_config.get('optimize', False):
+                logger.info(f"Optimizing {model_config['type']} model")
+                optimizer = OptunaOptimizer(type(model), feature_engineer, X, y, mean_absolute_error)
+                optimization_result = optimizer.optimize(n_trials=model_config.get('n_trials', 100))
+                model = optimization_result['best_model']
+            
+            model.fit(X, y)
+            models.append(model)
+        
+        # Create ensemble
+        if len(models) > 1:
+            logger.info("Creating ensemble model")
+            ensemble = EnsembleForecaster(models)
+        else:
+            ensemble = models[0]
+        
+        # Backtesting
+        logger.info("Performing backtesting")
+        backtester = FastBacktester(
+            ensemble, feature_engineer, 
+            [mean_absolute_error, root_mean_squared_error, symmetric_mean_absolute_percentage_error]
+        )
+        backtest_results = backtester.walk_forward_validation(
+            data, config['target_column'], 
+            config['backtesting']['start_date'], config['backtesting']['end_date'],
+            config['backtesting']['window_size'], config['backtesting']['step_size']
+        )
+        
+        # Calculate overall metrics
+        overall_metrics = backtester.calculate_overall_metrics(backtest_results)
+        logger.info(f"Overall metrics: {overall_metrics}")
+        
+        # Visualizations
+        logger.info("Generating visualizations")
+        plot_forecast(
+            backtest_results['test_start'], 
+            backtest_results['actual'].iloc[-1], 
+            backtest_results['predicted'].iloc[-1], 
+            title='Last Period Forecast vs Actual'
+        )
+        plot_metric_over_time(backtest_results['test_start'], backtest_results['metric_0'], 'Mean Absolute Error')
+        plot_feature_importance(X.columns, ensemble.get_feature_importance())
+        
+        logger.info("Forecasting pipeline completed successfully")
     
-    # Save preprocessor and feature engineer
-    joblib.dump(preprocessor, config['output']['preprocessor_path'])
-    joblib.dump(auto_fe, config['output']['feature_engineer_path'])
-    logger.info("Preprocessor and feature engineer saved.")
-    
-    # Prepare training data
-    X_train = train_df.drop(columns=[config['data']['target_column'], config['data']['date_column']])
-    y_train = train_df[config['data']['target_column']]
-    
-    # Create model
-    model = create_model(config)
-    logger.info(f"Model created: {type(model).__name__}")
-    
-    # Optimize model if specified
-    if config['optimization']['perform_hyperopt']:
-        best_params = optimize_model(model, X_train, y_train, config)
-        model = create_model({**config['model'], 'params': best_params})
-        logger.info(f"Model optimized. Best parameters: {best_params}")
-    
-    # Train model
-    model = train_model(model, X_train, y_train)
-    logger.info("Model training completed.")
-    
-    # Save model
-    if config['output']['save_model']:
-        model.save(config['output']['model_path'])
-        logger.info(f"Model saved to {config['output']['model_path']}")
-    
-    # Preprocess and engineer features for test data
-    test_df, _, _ = preprocess_and_engineer_features(test_df, config, is_training=False)
-    logger.info(f"Test data preprocessed and features engineered. New shape: {test_df.shape}")
-    
-    # Prepare test data
-    X_test = test_df.drop(columns=[config['data']['target_column'], config['data']['date_column']])
-    y_test = test_df[config['data']['target_column']]
-    
-    # Evaluate model
-    results = evaluate_model(model, X_test, y_test)
-    logger.info("Model evaluation completed.")
-    logger.info(f"Test set metrics: {results['metrics']}")
-    
-    # Save predictions
-    if config['output']['save_predictions']:
-        pd.DataFrame({
-            'date': test_df[config['data']['date_column']],
-            'true_values': y_test,
-            'predictions': results['predictions']
-        }).to_csv(config['output']['predictions_path'], index=False)
-        logger.info(f"Predictions saved to {config['output']['predictions_path']}")
-    
-    # Perform backtesting
-    backtester = FastBacktester(model, config['evaluation']['initial_train_size'], 
-                                config['evaluation']['step_size'], config['evaluation']['horizon'])
-    backtest_results = backtester.backtest(df.drop(columns=[config['data']['target_column']]), 
-                                           df[config['data']['target_column']])
-    logger.info("Backtesting completed.")
-    
-    # Plot results
-    backtester.plot_backtesting_results(backtest_results['results'])
-    backtester.plot_metric_over_time(backtest_results['results'], 'mape')
-    backtester.plot_feature_importance_over_time(backtest_results['feature_importance'])
-    logger.info("Results plotted.")
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}", exc_info=True)
 
 if __name__ == "__main__":
-    logger = setup_logger('forecasting_system', 'logs/forecasting_system.log')
-    main()
+    main("config.yaml")
