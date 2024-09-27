@@ -1,7 +1,0 @@
-output:
-  save_model: true
-  model_path: 'models/best_model.pkl'
-  preprocessor_path: 'models/preprocessor.pkl'
-  feature_engineer_path: 'models/feature_engineer.pkl'
-  save_predictions: true
-  predictions_path: 'output/predictions.csv'
