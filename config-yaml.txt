@@ -1,0 +1,85 @@
+# Data Configuration
+data:
+  raw_data_path: "data/raw/timeseries_data.csv"
+  processed_data_path: "data/processed/processed_data.csv"
+  date_column: "date"
+  target_column: "target"
+  categorical_columns: 
+    - "category1"
+    - "category2"
+  numerical_columns:
+    - "feature1"
+    - "feature2"
+    - "feature3"
+
+# Preprocessing Configuration
+preprocessing:
+  missing_value_strategy: "ffill"
+  encoding_method: "target_encoding"
+  scaling_method: "standard"
+
+# Feature Engineering Configuration
+feature_engineering:
+  time_based_features: true
+  lag_features: true
+  interaction_features: false
+  transformation_features: true
+  differencing: true
+  fourier_features: true
+  target_encoding: true
+
+# Model Configurations
+models:
+  gradient_boost:
+    n_estimators: 100
+    learning_rate: 0.1
+    max_depth: 5
+  lightgbm:
+    n_estimators: 100
+    learning_rate: 0.1
+    num_leaves: 31
+  lstm:
+    lstm_units: 64
+    dropout_rate: 0.2
+    learning_rate: 0.001
+  nbeats:
+    num_stacks: 3
+    num_blocks: 3
+    num_layers: 4
+    layer_width: 256
+
+# Hyperparameter Optimization Configuration
+optimize_hyperparameters: true
+optuna:
+  n_trials: 100
+  timeout: 3600  # 1 hour
+  n_jobs: -1  # Use all available cores
+
+# Ensemble Configuration
+ensemble:
+  gradient_boost: 0.25
+  lightgbm: 0.25
+  lstm: 0.25
+  nbeats: 0.25
+
+# Backtesting Configuration
+backtesting:
+  test_size: 0.2
+  n_splits: 5
+  horizon: 30  # Forecast horizon in days
+
+# Logging Configuration
+logging:
+  log_file: "fast_forecasting.log"
+  log_level: "INFO"
+
+# Saving and Loading Configuration
+save_load:
+  model_save_path: "data/models"
+  preprocessor_save_path: "data/models/preprocessor.joblib"
+  feature_engineer_save_path: "data/models/feature_engineer.joblib"
+
+# Execution Configuration
+execution:
+  random_seed: 42
+  use_gpu: false  # Set to true if GPU is available and you want to use it
